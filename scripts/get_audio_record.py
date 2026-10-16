@@ -1,42 +1,44 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Скачивание аудио-записи разговора КЦ РТУ по номеру обращения (conversationId).
+"""Скачивание аудио-записей разговоров КЦ РТУ (Атмосфера) по conversationId.
 
 Использование:
-    python scripts/get_audio_record.py <conversationId> [<conversationId> ...]
-    python scripts/get_audio_record.py 188
-    python scripts/get_audio_record.py 188 189
+    python get_audio_record.py <conversationId> [<conversationId> ...] [--env PATH] [--out DIR]
 
-Креды берутся из .env в корне проекта (baseUrl, user_login, user_pass).
-Файлы сохраняются в artifact/<conversationId>_<fileName>.
+Примеры:
+    python get_audio_record.py 188
+    python get_audio_record.py 188 189 --out artifact
 
-Цепочка:
-    1. POST /api/Auth/login            -> accessToken
-    2. GET  /api/ConversationsHistory/call-record-list?conversationId=N
-       -> список записей (fileName, relativePath)
-    3. GET  <baseUrl><relativePath>    -> mp3-файл
+Цепочка: POST /api/Auth/login -> GET /api/ConversationsHistory/call-record-list?conversationId=N
+         -> GET <baseUrl><relativePath> (mp3).
+Креды берутся из .env (формат JSON: baseUrl, user_login, user_pass).
+По умолчанию .env ищется в текущей папке, затем рядом со скриптом; файлы сохраняются в ./artifact.
 """
+import argparse
 import json
 import os
+import ssl
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
-import ssl
 
-PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENV_PATH = os.path.join(PROJ, ".env")
-OUT_DIR = os.path.join(PROJ, "artifact")
+SCRIPT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# на стенде сертификат не проходит полную проверку
+# сертификат стенда не проходит полную проверку
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
 
-def read_env(path):
-    # .env хранится в формате JSON: {"baseUrl": "...", "user_login": "...", ...}
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+def find_env(explicit):
+    candidates = [explicit, os.path.join(os.getcwd(), ".env"), os.path.join(SCRIPT_ROOT, ".env")]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    print("Не найден .env (формат JSON: baseUrl, user_login, user_pass). "
+          "Укажите путь через --env.", file=sys.stderr)
+    sys.exit(1)
 
 
 def request(url, token=None, headers=None, data=None, method="GET"):
@@ -47,23 +49,24 @@ def request(url, token=None, headers=None, data=None, method="GET"):
         h.update(headers)
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     with urllib.request.urlopen(req, context=SSL_CTX, timeout=60) as r:
-        return r.read(), r.headers
+        return r.read()
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
-    conv_ids = sys.argv[1:]
+    ap = argparse.ArgumentParser(description="Скачивание аудио-записей КЦ РТУ по conversationId")
+    ap.add_argument("conversation_ids", nargs="+", help="номера обращений (conversationId)")
+    ap.add_argument("--env", default=None, help="путь к .env (формат JSON)")
+    ap.add_argument("--out", default=None, help="папка для файлов (по умолчанию ./artifact)")
+    args = ap.parse_args()
 
-    env = read_env(ENV_PATH)
+    env = json.load(open(find_env(args.env), encoding="utf-8"))
     base = env["baseUrl"].rstrip("/")
     login = env["user_login"]
     password = env["user_pass"]
+    out_dir = args.out or os.path.join(os.getcwd(), "artifact")
 
-    # 1. Авторизация
     body = json.dumps({"login": login, "password": password}).encode("utf-8")
-    raw, _ = request(
+    raw = request(
         base + "/api/Auth/login",
         headers={"Content-Type": "application/json"},
         data=body,
@@ -72,30 +75,26 @@ def main():
     token = json.loads(raw)["accessToken"]
     print("[auth] OK")
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
     rc = 0
-    for cid in conv_ids:
-        # 2. Список записей обращения
+    for cid in args.conversation_ids:
         q = urllib.parse.urlencode({"conversationId": cid})
-        url = base + "/api/ConversationsHistory/call-record-list?" + q
         try:
-            raw, _ = request(url, token=token)
+            records = json.loads(request(base + "/api/ConversationsHistory/call-record-list?" + q, token=token))
         except urllib.error.HTTPError as e:
             print(f"[conv {cid}] ошибка HTTP {e.code}: {e.read()[:200]}")
             rc = 1
             continue
-        records = json.loads(raw)
         if not records:
             print(f"[conv {cid}] записей нет")
             continue
 
-        # 3. Скачивание по relativePath
         for rec in records:
             rel = rec.get("relativePath") or urllib.parse.urlparse(rec.get("link", "")).path
             fname = rec.get("fileName") or rel.rsplit("/", 1)[-1]
-            out = os.path.join(OUT_DIR, f"{cid}_{fname}")
-            raw, _ = request(base + rel, token=token)
+            out = os.path.join(out_dir, f"{cid}_{fname}")
+            raw = request(base + rel, token=token)
             with open(out, "wb") as f:
                 f.write(raw)
             print(f"[conv {cid}] сохранено: {out} ({len(raw)} байт)")
